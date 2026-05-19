@@ -2,15 +2,18 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const PDFDocument = require('pdfkit');
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-const MONGODB_URI = 'mongodb://app_mama:oDcxd8NdKm1JiYK6@ac-f6nogqp-shard-00-00.yzfekxm.mongodb.net:27017,ac-f6nogqp-shard-00-01.yzfekxm.mongodb.net:27017,ac-f6nogqp-shard-00-02.yzfekxm.mongodb.net:27017/?ssl=true&replicaSet=atlas-gx3s4e-shard-0&authSource=admin&appName=appmama';
+// ==========================================
+// MONGODB
+// ==========================================
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://app_mama:oDcxd8NdKm1JiYK6@ac-f6nogqp-shard-00-00.yzfekxm.mongodb.net:27017,ac-f6nogqp-shard-00-01.yzfekxm.mongodb.net:27017,ac-f6nogqp-shard-00-02.yzfekxm.mongodb.net:27017/?ssl=true&replicaSet=atlas-gx3s4e-shard-0&authSource=admin&appName=appmama';
 
 mongoose.connect(MONGODB_URI)
   .then(() => console.log('Conectado a MongoDB Atlas'))
@@ -30,7 +33,6 @@ const ventaSchema = new mongoose.Schema({
   imagenTransferencia: { type: String },
   clienteNombre: { type: String },
   direccion: { type: String },
-  // ===== NUEVO: estado de pago =====
   estadoPago: { type: String, default: 'Pagado', enum: ['Pagado', 'Pendiente'] },
   fechaPagado: { type: Date }
 });
@@ -47,19 +49,13 @@ clienteSchema.index({ nombre: 'text' });
 const Cliente = mongoose.model('Cliente', clienteSchema);
 
 // ==========================================
-// CORREO
+// CORREO (usando Resend)
 // ==========================================
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: 'cierredediaanavalenzuela@gmail.com',
-    pass: 'hapqgvwcskaiokdf'
-  }
-});
+const resend = new Resend(process.env.RESEND_API_KEY);
 const CORREO_DESTINO = 'cierredediaanavalenzuela@gmail.com';
 
 // ==========================================
-// HELPER: totales del día
+// HELPER
 // ==========================================
 const calcularTotales = (ventas) => {
   let totalBidones = 0;
@@ -98,7 +94,7 @@ app.post('/api/ventas', async (req, res) => {
           },
           $inc: { totalVentas: 1 }
         },
-        { upsert: true, new: true }
+        { upsert: true, returnDocument: 'after' }
       );
     }
 
@@ -118,7 +114,7 @@ app.put('/api/ventas/:id', async (req, res) => {
     const ventaActualizada = await Venta.findByIdAndUpdate(
       req.params.id,
       req.body,
-      { new: true }
+      { returnDocument: 'after' }
     );
     if (!ventaActualizada) return res.status(404).json({ error: 'Venta no encontrada' });
 
@@ -144,7 +140,7 @@ app.put('/api/ventas/:id', async (req, res) => {
 });
 
 // ==========================================
-// MARCAR COMO PAGADA (nueva ruta)
+// MARCAR COMO PAGADA
 // ==========================================
 app.put('/api/ventas/:id/pagar', async (req, res) => {
   try {
@@ -153,11 +149,10 @@ app.put('/api/ventas/:id/pagar', async (req, res) => {
       {
         estadoPago: 'Pagado',
         fechaPagado: new Date(),
-        // Si vienen datos adicionales (comprobante, método actualizado), los actualiza
         ...(req.body.imagenTransferencia && { imagenTransferencia: req.body.imagenTransferencia }),
         ...(req.body.metodoPago && { metodoPago: req.body.metodoPago })
       },
-      { new: true }
+      { returnDocument: 'after' }
     );
     if (!venta) return res.status(404).json({ error: 'Venta no encontrada' });
     console.log('Venta marcada como pagada:', venta._id);
@@ -224,7 +219,7 @@ app.get('/api/ventas/lista-hoy', async (req, res) => {
 });
 
 // ==========================================
-// LISTA DE PENDIENTES (de cualquier fecha)
+// LISTA DE PENDIENTES
 // ==========================================
 app.get('/api/ventas/pendientes', async (req, res) => {
   try {
@@ -240,7 +235,7 @@ app.get('/api/ventas/pendientes', async (req, res) => {
 });
 
 // ==========================================
-// BUSCAR CLIENTES (autocompletado)
+// BUSCAR CLIENTES
 // ==========================================
 app.get('/api/clientes/buscar', async (req, res) => {
   try {
@@ -268,7 +263,7 @@ app.get('/api/clientes', async (req, res) => {
 });
 
 // ==========================================
-// GENERAR PDF Y ENVIAR AL CORREO
+// GENERAR PDF Y ENVIAR AL CORREO (usando Resend)
 // ==========================================
 app.get('/api/ventas/enviar-cierre', async (req, res) => {
   try {
@@ -284,17 +279,25 @@ app.get('/api/ventas/enviar-cierre', async (req, res) => {
     doc.on('end', async () => {
       const pdfData = Buffer.concat(buffers);
       const fechaTexto = new Date().toLocaleDateString('es-CL');
+
       try {
-        await transporter.sendMail({
-          from: '"App Agua Mama" <reportes@appmama.com>',
+        const result = await resend.emails.send({
+          from: 'App Agua Mama <onboarding@resend.dev>',
           to: CORREO_DESTINO,
           subject: `Cierre de Caja - ${fechaTexto}`,
           text: `Hola. Adjunto el reporte oficial en PDF con el balance del dia.`,
           attachments: [{
             filename: `Cierre_Caja_${fechaTexto.replace(/\//g, '-')}.pdf`,
-            content: pdfData
+            content: pdfData.toString('base64')
           }]
         });
+
+        if (result.error) {
+          console.error('Error de Resend:', result.error);
+          return res.status(500).json({ error: 'Fallo el envio del correo: ' + result.error.message });
+        }
+
+        console.log('Correo enviado:', result.data?.id);
         res.json({ mensaje: 'Reporte enviado exitosamente' });
       } catch (mailError) {
         console.error('Error al enviar el email:', mailError);
@@ -322,7 +325,6 @@ app.get('/api/ventas/enviar-cierre', async (req, res) => {
     }
     doc.moveDown(2);
 
-    // ===== HELPER PARA LISTAR VENTAS =====
     const listarVenta = (venta, index) => {
       const total = Number(venta.total) || 0;
       const esPendiente = venta.estadoPago === 'Pendiente';
@@ -332,7 +334,6 @@ app.get('/api/ventas/enviar-cierre', async (req, res) => {
         .text(`   Cliente: ${venta.clienteNombre || 'N/A'} | Bidones: ${venta.cantidadBidones || 0} | Precio c/u: $${(venta.precioUnitario || 0).toLocaleString('es-CL')} | Total: $${total.toLocaleString('es-CL')}`);
     };
 
-    // ===== EFECTIVO =====
     doc.fontSize(16).fillColor('#16a34a').text('Detalle Ventas en Efectivo:', { underline: true });
     doc.moveDown();
     const ventasEfectivo = ventasHoy.filter(v => v.metodoPago === 'Efectivo');
@@ -346,7 +347,6 @@ app.get('/api/ventas/enviar-cierre', async (req, res) => {
     }
     doc.moveDown(1.5);
 
-    // ===== TRANSFERENCIAS =====
     doc.fontSize(16).fillColor('#0284c7').text('Detalle de Transferencias Cargadas:', { underline: true });
     doc.moveDown();
     const transferencias = ventasHoy.filter(v => v.metodoPago === 'Transferencia');
@@ -371,7 +371,6 @@ app.get('/api/ventas/enviar-cierre', async (req, res) => {
       });
     }
 
-    // ===== PENDIENTES =====
     const pendientes = ventasHoy.filter(v => v.estadoPago === 'Pendiente');
     if (pendientes.length > 0) {
       doc.moveDown(1);

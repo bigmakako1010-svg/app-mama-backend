@@ -31,22 +31,23 @@ const ventaSchema = new mongoose.Schema({
   montoRecibido: { type: Number, default: 0 },
   vuelto: { type: Number, default: 0 },
   imagenTransferencia: { type: String },
-  clienteNombre: { type: String },
-  direccion: { type: String },
+  clienteNombre: { type: String, default: '' }, // ahora opcional
+  direccion: { type: String, required: true },   // ahora obligatoria
   estadoPago: { type: String, default: 'Pagado', enum: ['Pagado', 'Pendiente'] },
   fechaPagado: { type: Date }
 });
 const Venta = mongoose.model('Venta', ventaSchema);
 
-const clienteSchema = new mongoose.Schema({
-  nombre: { type: String, required: true, unique: true },
-  direccion: { type: String, default: '' },
+// ===== NUEVA colección: direcciones (reemplaza a clientes) =====
+const direccionSchema = new mongoose.Schema({
+  direccion: { type: String, required: true, unique: true },
+  clienteNombre: { type: String, default: '' },
   precioHabitual: { type: Number, default: 2500 },
   ultimaVenta: { type: Date, default: Date.now },
   totalVentas: { type: Number, default: 0 }
 });
-clienteSchema.index({ nombre: 'text' });
-const Cliente = mongoose.model('Cliente', clienteSchema);
+direccionSchema.index({ direccion: 'text' });
+const Direccion = mongoose.model('Direccion', direccionSchema);
 
 // ==========================================
 // CORREO (usando Resend)
@@ -79,24 +80,27 @@ const calcularTotales = (ventas) => {
 // ==========================================
 app.post('/api/ventas', async (req, res) => {
   try {
+    if (!req.body.direccion || !req.body.direccion.trim()) {
+      return res.status(400).json({ error: 'La dirección es obligatoria' });
+    }
+
     const nuevaVenta = new Venta(req.body);
     const ventaGuardada = await nuevaVenta.save();
 
-    if (req.body.clienteNombre && req.body.clienteNombre.trim()) {
-      const nombreLimpio = req.body.clienteNombre.trim();
-      await Cliente.findOneAndUpdate(
-        { nombre: nombreLimpio },
-        {
-          $set: {
-            direccion: req.body.direccion || '',
-            precioHabitual: req.body.precioUnitario || 2500,
-            ultimaVenta: new Date()
-          },
-          $inc: { totalVentas: 1 }
+    // Actualiza la colección de direcciones
+    const direccionLimpia = req.body.direccion.trim();
+    await Direccion.findOneAndUpdate(
+      { direccion: direccionLimpia },
+      {
+        $set: {
+          clienteNombre: req.body.clienteNombre || '',
+          precioHabitual: req.body.precioUnitario || 2500,
+          ultimaVenta: new Date()
         },
-        { upsert: true, returnDocument: 'after' }
-      );
-    }
+        $inc: { totalVentas: 1 }
+      },
+      { upsert: true, returnDocument: 'after' }
+    );
 
     console.log('Venta registrada:', ventaGuardada._id, '-', ventaGuardada.metodoPago, '-', ventaGuardada.estadoPago, '$' + ventaGuardada.total);
     res.status(201).json({ mensaje: 'Venta guardada con exito', venta: ventaGuardada });
@@ -118,13 +122,13 @@ app.put('/api/ventas/:id', async (req, res) => {
     );
     if (!ventaActualizada) return res.status(404).json({ error: 'Venta no encontrada' });
 
-    if (req.body.clienteNombre && req.body.clienteNombre.trim()) {
-      const nombreLimpio = req.body.clienteNombre.trim();
-      await Cliente.findOneAndUpdate(
-        { nombre: nombreLimpio },
+    if (req.body.direccion && req.body.direccion.trim()) {
+      const direccionLimpia = req.body.direccion.trim();
+      await Direccion.findOneAndUpdate(
+        { direccion: direccionLimpia },
         {
           $set: {
-            direccion: req.body.direccion || '',
+            clienteNombre: req.body.clienteNombre || '',
             precioHabitual: req.body.precioUnitario || 2500
           }
         },
@@ -235,35 +239,35 @@ app.get('/api/ventas/pendientes', async (req, res) => {
 });
 
 // ==========================================
-// BUSCAR CLIENTES
+// BUSCAR DIRECCIONES (autocompletado)
 // ==========================================
-app.get('/api/clientes/buscar', async (req, res) => {
+app.get('/api/direcciones/buscar', async (req, res) => {
   try {
     const q = (req.query.q || '').trim();
     if (q.length < 1) return res.json([]);
     const regex = new RegExp(q, 'i');
-    const clientes = await Cliente.find({ nombre: regex })
+    const direcciones = await Direccion.find({ direccion: regex })
       .sort({ ultimaVenta: -1 })
       .limit(8);
-    res.json(clientes);
+    res.json(direcciones);
   } catch (error) {
-    console.error('Error al buscar clientes:', error);
-    res.status(500).json({ error: 'Error al buscar clientes' });
+    console.error('Error al buscar direcciones:', error);
+    res.status(500).json({ error: 'Error al buscar direcciones' });
   }
 });
 
-app.get('/api/clientes', async (req, res) => {
+app.get('/api/direcciones', async (req, res) => {
   try {
-    const clientes = await Cliente.find().sort({ ultimaVenta: -1 });
-    res.json(clientes);
+    const direcciones = await Direccion.find().sort({ ultimaVenta: -1 });
+    res.json(direcciones);
   } catch (error) {
-    console.error('Error al listar clientes:', error);
-    res.status(500).json({ error: 'Error al listar clientes' });
+    console.error('Error al listar direcciones:', error);
+    res.status(500).json({ error: 'Error al listar direcciones' });
   }
 });
 
 // ==========================================
-// GENERAR PDF Y ENVIAR AL CORREO (usando Resend)
+// GENERAR PDF Y ENVIAR AL CORREO
 // ==========================================
 app.get('/api/ventas/enviar-cierre', async (req, res) => {
   try {
@@ -330,8 +334,9 @@ app.get('/api/ventas/enviar-cierre', async (req, res) => {
       const esPendiente = venta.estadoPago === 'Pendiente';
       doc.fontSize(12).fillColor(esPendiente ? '#dc2626' : '#000');
       doc.text(`${index + 1}. ${esPendiente ? '[PENDIENTE] ' : ''}Direccion: ${venta.direccion || 'Sin direccion'}`);
+      const nombreTexto = venta.clienteNombre ? `${venta.clienteNombre} | ` : '';
       doc.fillColor('#444')
-        .text(`   Cliente: ${venta.clienteNombre || 'N/A'} | Bidones: ${venta.cantidadBidones || 0} | Precio c/u: $${(venta.precioUnitario || 0).toLocaleString('es-CL')} | Total: $${total.toLocaleString('es-CL')}`);
+        .text(`   ${nombreTexto}Bidones: ${venta.cantidadBidones || 0} | Precio c/u: $${(venta.precioUnitario || 0).toLocaleString('es-CL')} | Total: $${total.toLocaleString('es-CL')}`);
     };
 
     doc.fontSize(16).fillColor('#16a34a').text('Detalle Ventas en Efectivo:', { underline: true });
